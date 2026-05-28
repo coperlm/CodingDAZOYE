@@ -1,0 +1,509 @@
+main.cpp:
+#include <iostream>
+using namespace std;
+#include"schedule.h"
+ofstream log;
+volatile bool exiting;
+
+void helpInfo()
+{
+ cout<<"*******************************\n";
+ cout<<"COMMAND LIST:\n";
+ cout<<"create process_ name process_ length (create p0 8)\n";
+ cout<<"\t append a process to the process list\n";
+ cout<<"remove process_ name (remove p0)\n";
+ cout<<"\t remove a process from the process list\n";
+ cout<<"current\t show current runprocess readyList\n";
+ cout<<"exit\t exit this simulation\n";
+ cout<<"helpl\t get command imformation\n";
+ cout<<"********************************\n\n";
+}
+
+int main()
+{
+ char name[20]={'\0'};
+ HANDLE hSchedule;
+ log.open("Process_log.txt");
+ helpInfo();
+ hSchedule=init();
+ if (hSchedule==NULL)
+ {
+  cout <<"\nCreate schedule-process failed. System will abort!"<<endl;
+  exiting=true;
+    }
+ char command[30]= {0};
+ while (!exiting)
+ {
+  cout<<"COMMAND>";
+  cin>>command;
+  if (strcmp(command,"exit")==0)
+     break;
+  else if (strcmp(command,"create")==0)
+  {
+   char name[20]={'\0'};
+   int time=0;
+   cin>>name>>time;
+   createProcess(name,time);
+        }
+  else if(strcmp(command,"remove")==0)
+  {
+   cin>>name;
+   removeProcess(name);
+  }
+  else if(strcmp(command,"current")==0)
+      printCurrent();
+  else if(strcmp(command,"help")==0)
+      helpInfo();
+  else
+      cout<<"Enter help to get command information!\n";
+    }
+    exiting=true;
+ if (hSchedule!=NULL)
+ {
+     WaitForSingleObject(hSchedule,INFINITE);
+  CloseHandle(hSchedule);
+ }
+ log.close();
+ cout<<"\n*******End*******\n"<<endl;
+ return 0;
+}
+schedule.h:
+#include <string.h>
+#include <windows.h>
+#include <iostream>
+#include <fstream>
+using namespace std;
+
+#ifndef SCHEDULE_H
+#define SCHEDULE_H
+
+enum STATUS{
+ RUN,
+ READY,
+ WAIT
+};
+
+typedef struct PCB{
+ int id;
+ char name[20];
+ enum STATUS status;
+ int flag;
+ HANDLE hThis;
+ DWORD threadID;
+ int count;
+ struct PCB *next;
+}PCB,*pPCB;
+
+typedef struct{
+ pPCB head;
+ pPCB tail;
+ int pcbNum;
+}readyList,freeList,*pList;
+
+
+const int PCB_LIMIT=30;
+
+HANDLE init();
+void createProcess(char *name,int ax);
+void scheduleProcess();
+void removeProcess(char *name);
+void fprintReadyList();
+void printReadyList();
+void printCurrent();
+void stopAllTreads();
+#endif
+schedule.cpp
+#include"schedule.h"
+readyList readylist;
+pList pReadyList=&readylist;
+freeList freelist;
+pList pFreeList=&freelist;
+PCB pcb[PCB_LIMIT];
+pPCB runPCB;
+int pid=0;
+
+CRITICAL_SECTION cs_ReadyList;
+CRITICAL_SECTION cs_SaveInfo;
+
+extern ofstream log;
+extern volatile bool exiting;
+
+void initialPCB(pPCB p)
+{
+ p->id=0;
+ strcpy(p->name,"NoName");
+ p->status=WAIT;
+ p->next=NULL;
+ p->hThis=NULL;
+ p->threadID=0;
+ p->flag=1;
+ p->count=0;
+}
+
+pPCB getPcbFromFreeList()
+{
+ pPCB freePCB=NULL;
+ if(pFreeList->head != NULL && pFreeList->pcbNum>0)
+ {
+  freePCB=pFreeList->head;
+  pFreeList->head=pFreeList->head->next;
+  pFreeList->pcbNum--;
+ }
+ return freePCB;
+}
+
+void returnPcbToFreeList(pPCB p)
+{
+ if(pFreeList->head==NULL)
+ {
+  pFreeList->head=p;
+  pFreeList->tail=p;
+  p->next=NULL;
+  pFreeList->pcbNum++;
+ }
+ else
+ {
+  p->next=pFreeList->head;
+  pFreeList->head-p;
+  pFreeList->pcbNum++;
+ }
+}
+
+DWORD WINAPI processThread(LPVOID lpParameter)
+{
+ pPCB currentPcb=(pPCB)lpParameter;
+ while (true)
+ {
+  if(currentPcb->flag=1)
+  {
+   currentPcb->flag=0;
+   EnterCriticalSection(&cs_SaveInfo);
+   log<<"Process"<<currentPcb->id<<":"<<currentPcb->name<<"is running........."<<endl;
+   LeaveCriticalSection(&cs_SaveInfo);
+  }
+  Sleep(800);
+  return 1;
+ }
+}
+
+DWORD WINAPI scheduleThread(LPVOID IpParameter)
+{
+ pList preadyList=(pList)IpParameter;
+ while(!exiting)
+ {
+  scheduleProcess();
+ }
+ stopAllTreads();
+ return 1;
+}
+
+HANDLE init()
+{
+ pPCB p=pcb;
+ pReadyList->head=NULL;
+ pReadyList->tail=NULL;
+ pReadyList->pcbNum=0;
+ pFreeList->head=&pcb[0];
+ pFreeList->tail=&pcb[PCB_LIMIT-1];
+ pFreeList->pcbNum=PCB_LIMIT;
+ for(int i=0;i<PCB_LIMIT-1;i++)
+ {
+  initialPCB(p);
+  p->next=&pcb[i+1];
+  p++;
+ }
+ initialPCB(p);
+ pcb[PCB_LIMIT-1].next=NULL;
+ InitializeCriticalSection(&cs_ReadyList);
+ InitializeCriticalSection(&cs_SaveInfo);
+ exiting=false;
+ HANDLE hSchedule;
+ hSchedule=CreateThread(
+  NULL,
+  0,
+  scheduleThread,
+  pReadyList,
+  0,
+  NULL
+ );
+ char pName[6]="p00";
+ for(int i=0;i<6;i++)
+ {
+  pName[2]='0'+i;
+  createProcess(pName,10);
+ }
+ return hSchedule;
+}
+
+void createProcess(char *name,int count)
+{
+ EnterCriticalSection(&cs_ReadyList);
+ if(pFreeList->pcbNum>0)
+ {
+  pPCB newPcb=getPcbFromFreeList();
+   newPcb->status=READY;
+   strcpy(newPcb->name,name);
+   newPcb->count=count;
+   newPcb->id=pid++;
+   newPcb->next=NULL;
+   if(pReadyList->pcbNum==0)
+   {
+    pReadyList->head=newPcb;
+    pReadyList->tail=newPcb;
+    pReadyList->pcbNum++;
+    }
+    else
+    {
+     pReadyList->tail->next=newPcb;
+     pReadyList->tail=newPcb;
+     pReadyList->pcbNum++;
+    }
+    cout<<"New Process Created,Process ID:"
+       <<newPcb->id<<",Process Name:"
+       <<newPcb->name<<",ProcessLength:"<<newPcb->count<<endl;
+    cout<<"Current ReadyList is:"<<endl;
+    printReadyList();
+    EnterCriticalSection(&cs_SaveInfo);
+    log<<"New Process Created,Process ID:"
+       <<newPcb->id<<",Process Name:"
+       <<newPcb->name<<",Process LEngth:"<<newPcb->count<<endl;
+    log<<"Current ReadyList is:"<<endl;
+    fprintReadyList();
+    LeaveCriticalSection(&cs_SaveInfo);
+    newPcb->hThis=CreateThread(NULL,0,processThread,newPcb,CREATE_SUSPENDED,&(newPcb->threadID));
+ }
+ else
+ {
+  cout<<"New process intend to append.But PCB has been used out!"<<endl;
+  EnterCriticalSection(&cs_SaveInfo);
+  log<<"New process intend to append.But PCB has been used out!"<<endl;
+  LeaveCriticalSection(&cs_SaveInfo);
+ }
+ LeaveCriticalSection(&cs_ReadyList);
+}
+
+void scheduleProcess()
+{
+ EnterCriticalSection(&cs_ReadyList);
+ if(pReadyList)
+ {
+  runPCB=pReadyList->head;
+  pReadyList->head=pReadyList->head->next;
+  if(pReadyList->head==NULL)
+   pReadyList->tail=NULL;
+  pReadyList->pcbNum--;
+  runPCB->count--;
+  runPCB->flag=1;
+  EnterCriticalSection(&cs_SaveInfo);
+  log<<"Process"<<runPCB->id<<':'<<runPCB->name<<"is to be shceduleed"<<endl;
+  LeaveCriticalSection(&cs_SaveInfo);
+  ResumeThread(runPCB->hThis);
+  runPCB->status=RUN;
+  Sleep(1000);
+  EnterCriticalSection(&cs_SaveInfo);
+  log<<"\nOne time slot used out!\n"<<endl;
+  LeaveCriticalSection(&cs_SaveInfo);
+  runPCB->status=READY;
+  if(runPCB!=NULL&runPCB->count<=0)
+  {
+   cout<<"\n*******Process"<<runPCB->id<<':'<<runPCB->name<<"has finished.******"<<endl;
+   printReadyList();
+   cout<<"COMMAND>";
+   cout<<flush;
+   EnterCriticalSection(&cs_SaveInfo);
+   log<<"\n*******Process"<<runPCB->id<<':'<<runPCB->name<<"has finished.******"<<endl;
+   fprintReadyList();
+   log<<flush;
+   LeaveCriticalSection(&cs_SaveInfo);
+   if(!TerminateThread(runPCB->hThis,1))
+   {
+    EnterCriticalSection(&cs_SaveInfo);
+    log<<"Terminate thread failed!System will abort!"<<endl;
+    LeaveCriticalSection(&cs_SaveInfo);
+    exiting=true;
+   }
+   else
+   {
+    CloseHandle(runPCB->hThis);
+    returnPcbToFreeList(runPCB);
+    runPCB=NULL;
+   }
+  }
+  else if(runPCB != NULL)
+  {
+   if(pReadyList->pcbNum<=0)
+   {
+    pReadyList->head=runPCB;
+    pReadyList->tail=runPCB;
+   }
+   else
+   {
+    pReadyList->tail->next=runPCB;
+    pReadyList->tail=runPCB;
+   }
+   runPCB->next=NULL;
+   runPCB=NULL;
+   pReadyList->pcbNum++;
+  }
+ }
+ else if(pReadyList!=NULL)
+ {
+  pReadyList->head=NULL;
+  pReadyList->tail=NULL;
+  pReadyList->pcbNum=0;
+ }
+ LeaveCriticalSection(&cs_SaveInfo);
+}
+
+void removeProcess(char *name)
+{
+    pPCB removeTarget = NULL;
+    pPCB preTemp = NULL;
+    EnterCriticalSection(&cs_ReadyList);
+    if (runPCB != NULL && strcmp(name,runPCB->name)==0 )
+    {
+        removeTarget=runPCB;
+        if (!(TerminateThread(removeTarget->hThis,1)))
+        {
+            cout<<"Terminate thread failed! System will abort!"<<endl;
+            EnterCriticalSection(&cs_SaveInfo);
+            log<<"Terminate thread failed! System will abort!"<<endl;
+            LeaveCriticalSection(&cs_SaveInfo);
+            exit(0);
+        }
+        else
+        {
+            CloseHandle(removeTarget->hThis);
+            returnPcbToFreeList(removeTarget);
+            runPCB=NULL;
+            cout<<"\nProcess"<<removeTarget->id<<":"<<removeTarget->name<<"has been removed."<<endl;
+            cout<<"Current ReadyList is:\n";
+            printReadyList();
+            EnterCriticalSection(&cs_SaveInfo);
+            log<<"\nProcess"<<removeTarget->id<<":"<<removeTarget->name<<"has been removed."<<endl;
+   log<<"Current ReadyList is:\n";
+            fprintReadyList();
+            log<<flush;
+            LeaveCriticalSection(&cs_SaveInfo);
+            LeaveCriticalSection(&cs_ReadyList);
+            return;
+        }
+    }
+    if (pReadyList->head != NULL)
+    {
+     removeTarget=pReadyList->head;
+        while(removeTarget!=NULL)
+        {
+            if (strcmp(name,removeTarget->name)==0)
+            {
+                if (removeTarget==pReadyList->head)
+                {
+                    pReadyList->head=pReadyList->head->next;
+                    if (pReadyList->head==NULL)
+                        pReadyList->tail=NULL;
+                }
+                else
+                {
+                    preTemp->next=removeTarget->next;
+                    if (removeTarget==pReadyList->tail)
+                         pReadyList->tail=preTemp;
+                }
+                if (!TerminateThread(removeTarget->hThis,0))
+                {
+                    cout<<"Terminate thread failed! System will abort!"<<endl;
+                    EnterCriticalSection(&cs_SaveInfo);
+                    log<<"Terminate thread failed! System will abort!"<<endl;
+                    LeaveCriticalSection(&cs_SaveInfo);
+                    LeaveCriticalSection(&cs_ReadyList);
+                    exit(0);
+                }
+                CloseHandle(removeTarget->hThis);
+                returnPcbToFreeList(removeTarget);
+                pReadyList->pcbNum--;
+                cout<<"Process"<<removeTarget->id<<":"<<removeTarget->name<<"has been removed."<<endl;
+    cout<<"currentreadyList is:"<<endl;
+                printReadyList();
+                EnterCriticalSection(&cs_SaveInfo);
+                log<<"Process"<<removeTarget->id<<":"<<removeTarget->name<<"has been removed."<<endl;
+    log<<"currentreadyList is:"<<endl;
+                fprintReadyList();
+                log<<flush;
+                LeaveCriticalSection(&cs_SaveInfo);
+                LeaveCriticalSection(&cs_ReadyList);
+                return;
+            }
+            else
+            {
+                preTemp==removeTarget;
+                removeTarget=removeTarget->next;
+            }
+        }
+    }
+    LeaveCriticalSection(&cs_ReadyList);
+ cout<<"Sorry, there's no process named "<<name<<endl;
+ return;
+}
+
+void fprintReadyList()
+{
+ pPCB tmp=NULL;
+ tmp=pReadyList->head;
+ if (tmp != NULL)
+        for (int i=0;i<pReadyList->pcbNum;i++)
+  {
+   log<<"--"<<tmp->id<<":"<<tmp->name<< "--";
+   tmp=tmp->next;
+        }
+    else
+     log<<"NULL";
+    log<<endl<<endl;
+}
+
+void printReadyList()
+{
+ pPCB tmp=NULL;
+ tmp=pReadyList->head;
+ if (tmp != NULL)
+ for (int i=0;i<pReadyList->pcbNum;i++)
+ {
+  cout<<"--"<<tmp->id<<":"<<tmp->name<<"--";
+  tmp=tmp->next;
+    }
+    else
+        cout<<"NULL";
+ cout<<endl;
+}
+
+void printCurrent()
+{
+ if (runPCB != NULL)
+    cout<<"Process"<<runPCB->name<<"is running..."<<endl;
+ else
+    cout<<"No process is running."<< endl;
+    cout<<"Current readyList is:"<<endl;
+ printReadyList();
+}
+
+void stopAllTreads()
+{
+ if (runPCB != NULL)
+ {
+  TerminateThread(runPCB->hThis,0);
+  CloseHandle(runPCB->hThis);
+    }
+ pPCB q,p=pReadyList->head;
+ while (p != NULL)
+ {
+  if (!TerminateThread(p->hThis,0))
+  {
+   cout<<"Terminate thread failed! System will abort!"<<endl;
+   exit(0);
+  }
+  CloseHandle(p->hThis);
+  q-p->next;
+  returnPcbToFreeList(p);
+  p=q;
+ }
+}
+
+
