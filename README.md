@@ -59,3 +59,40 @@
 
 
 * **目标 3：一键生成报告（选做，用于极限炫技）。** 写个简单的模板，将收集到的 `Vulnerability` 列表渲染成一个 HTML 网页。
+
+---
+
+### 当前实现（已完成）
+
+- 主程序：`threadviper.py`
+- 单元测试：`test_threadviper.py`
+
+功能覆盖：
+- ✅ 注释剔除（`//` 与 `/* */`）
+- ✅ 统一漏洞结构体 `Vulnerability`（文件名、行号、类型、代码片段、修复建议等）
+- ✅ 危险函数扫描（重点 `strcpy`）与自动修复建议
+- ✅ 临界区状态跟踪（`EnterCriticalSection` / `LeaveCriticalSection`）
+- ✅ 临界区内异常退出检测（`return` / `break` / `exit(...)`）
+- ✅ `TerminateThread` 架构级风险检测
+- ✅ 终端彩色输出（检测到 `rich` 时自动启用，未安装时自动降级）
+- ✅ HTML 报告生成（可选）
+
+### 使用方式
+
+检测文件并输出到终端：
+
+```bash
+python threadviper.py 测试用例1.txt
+```
+
+检测并生成 HTML 报告：
+
+```bash
+python threadviper.py 测试用例1.txt --html report.html
+```
+
+运行测试：
+
+```bash
+python -m unittest -v
+```
