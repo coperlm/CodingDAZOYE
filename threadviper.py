@@ -23,10 +23,12 @@ _BLACKLIST_RULES = {
     "strcpy": (
         "危险内存 API",
         "检测到危险函数 `strcpy`，建议替换为安全的带边界检查函数 "
-        "`strncpy(newPcb->name, name, sizeof(newPcb->name) - 1);`",
+        "`strncpy(dest, src, sizeof(dest) - 1);`",
         "HIGH",
     )
 }
+
+_STRCPY_CALL_PATTERN = re.compile(r"\bstrcpy\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)")
 
 
 def strip_comments(source: str) -> str:
@@ -108,8 +110,18 @@ def strip_comments(source: str) -> str:
 def _detect_blacklist(lines: Iterable[str], filename: str) -> List[Vulnerability]:
     findings: List[Vulnerability] = []
     for line_no, line in enumerate(lines, start=1):
-        for func_name, (vuln_type, remediation, severity) in _BLACKLIST_RULES.items():
+        for func_name, (vuln_type, default_remediation, severity) in _BLACKLIST_RULES.items():
             if re.search(rf"\b{re.escape(func_name)}\s*\(", line):
+                remediation = default_remediation
+                if func_name == "strcpy":
+                    match = _STRCPY_CALL_PATTERN.search(line)
+                    if match:
+                        dest = match.group(1).strip()
+                        src = match.group(2).strip()
+                        remediation = (
+                            "检测到危险函数 `strcpy`，建议替换为安全的带边界检查函数 "
+                            f"`strncpy({dest}, {src}, sizeof({dest}) - 1);`"
+                        )
                 findings.append(
                     Vulnerability(
                         filename=filename,

@@ -12,9 +12,11 @@ class ThreadViperTests(unittest.TestCase):
         self.assertIn('"http://x"', clean)
 
     def test_detects_strcpy(self) -> None:
-        code = "void f(){ strcpy(newPcb->name,name); }"
+        code = "void f(){ strcpy(p->name, \"NoName\"); }"
         _, findings = analyze_source(code, "schedule.cpp")
         self.assertTrue(any(f.vulnerability_type == "危险内存 API" for f in findings))
+        remediation = next(f.remediation for f in findings if f.vulnerability_type == "危险内存 API")
+        self.assertIn("strncpy(p->name, \"NoName\", sizeof(p->name) - 1);", remediation)
 
     def test_detects_critical_section_early_exit(self) -> None:
         code = """
