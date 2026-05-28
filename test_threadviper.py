@@ -34,6 +34,23 @@ class ThreadViperTests(unittest.TestCase):
         _, findings = analyze_source(code, "schedule.cpp")
         self.assertTrue(any(f.vulnerability_type == "架构级风险 API" for f in findings))
 
+    def test_detects_nested_critical_sections_exit(self) -> None:
+        code = """
+        void f() {
+            EnterCriticalSection(&cs_A);
+            EnterCriticalSection(&cs_B);
+            return;
+            LeaveCriticalSection(&cs_B);
+            LeaveCriticalSection(&cs_A);
+        }
+        """
+        _, findings = analyze_source(code, "schedule.cpp")
+        critical = [f for f in findings if f.vulnerability_type == "临界区未释放退出"]
+        self.assertEqual(len(critical), 1)
+        joined_path = "\n".join(critical[0].execution_path)
+        self.assertIn("cs_A", joined_path)
+        self.assertIn("cs_B", joined_path)
+
 
 if __name__ == "__main__":
     unittest.main()

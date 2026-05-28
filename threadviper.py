@@ -31,8 +31,8 @@ _BLACKLIST_RULES = {
 
 def strip_comments(source: str) -> str:
     result: List[str] = []
-    in_single_line = False
-    in_multi_line = False
+    in_single_line_comment = False
+    in_multi_line_comment = False
     in_string = False
     in_char = False
     escaped = False
@@ -42,16 +42,16 @@ def strip_comments(source: str) -> str:
         ch = source[i]
         nxt = source[i + 1] if i + 1 < len(source) else ""
 
-        if in_single_line:
+        if in_single_line_comment:
             if ch == "\n":
-                in_single_line = False
+                in_single_line_comment = False
                 result.append(ch)
             i += 1
             continue
 
-        if in_multi_line:
+        if in_multi_line_comment:
             if ch == "*" and nxt == "/":
-                in_multi_line = False
+                in_multi_line_comment = False
                 i += 2
             else:
                 if ch == "\n":
@@ -76,12 +76,12 @@ def strip_comments(source: str) -> str:
             continue
 
         if ch == "/" and nxt == "/":
-            in_single_line = True
+            in_single_line_comment = True
             i += 2
             continue
 
         if ch == "/" and nxt == "*":
-            in_multi_line = True
+            in_multi_line_comment = True
             i += 2
             continue
 
@@ -125,6 +125,7 @@ def _detect_blacklist(lines: Iterable[str], filename: str) -> List[Vulnerability
 
 def _detect_concurrency_issues(lines: List[str], filename: str) -> List[Vulnerability]:
     findings: List[Vulnerability] = []
+    # Tracks active critical sections as (line_number, code_snippet) tuples.
     lock_stack: List[tuple[int, str]] = []
 
     for line_no, line in enumerate(lines, start=1):
@@ -136,7 +137,7 @@ def _detect_concurrency_issues(lines: List[str], filename: str) -> List[Vulnerab
             lock_stack.append((line_no, stripped))
 
         if lock_stack and re.search(r"\b(return|break)\b|exit\s*\(", stripped):
-            lock_line_no, lock_line = lock_stack[-1]
+            lock_chain = [f"[Line {ln}] 锁被获取: {code}" for ln, code in lock_stack]
             findings.append(
                 Vulnerability(
                     filename=filename,
@@ -145,10 +146,8 @@ def _detect_concurrency_issues(lines: List[str], filename: str) -> List[Vulnerab
                     code_snippet=stripped,
                     remediation="检测到临界区未释放即退出，可能导致全局死锁。请确保先调用 LeaveCriticalSection。",
                     severity="CRITICAL",
-                    execution_path=[
-                        f"[Line {lock_line_no}] 锁被获取: {lock_line}",
-                        f"[Line {line_no}] 异常退出: {stripped} (致命: 锁未释放!)",
-                    ],
+                    execution_path=lock_chain
+                    + [f"[Line {line_no}] 异常退出: {stripped} (致命: 锁未释放!)"],
                 )
             )
 
@@ -187,7 +186,7 @@ def _render_console(path: Path, clean_source: str, findings: List[Vulnerability]
     try:
         from rich.console import Console
         from rich.table import Table
-    except Exception:  # pragma: no cover
+    except ImportError:  # pragma: no cover
         Console = None
 
     if Console is None:
