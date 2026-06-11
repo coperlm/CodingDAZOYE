@@ -1,7 +1,7 @@
 import unittest
 import json
 
-from threadviper import analyze_source, strip_comments, _detect_language, _parse_semgrep_json, _default_html_path
+from threadviper import analyze_source, strip_comments, _detect_language, _parse_semgrep_json, _default_html_path, _build_semgrep_remediation
 
 
 class ThreadViperTests(unittest.TestCase):
@@ -12,47 +12,29 @@ class ThreadViperTests(unittest.TestCase):
         self.assertNotIn("block", clean)
         self.assertIn('"http://x"', clean)
 
-    def test_detects_strcpy(self) -> None:
-        code = "void f(){ strcpy(p->name, \"NoName\"); }"
-        _, findings = analyze_source(code, "schedule.cpp")
-        self.assertTrue(any(f.vulnerability_type == "危险内存 API" for f in findings))
-        remediation = next(f.remediation for f in findings if f.vulnerability_type == "危险内存 API")
-        self.assertIn("strncpy(p->name, \"NoName\", sizeof(p->name) - 1);", remediation)
+    def test_strip_comments_removes_python_comments(self) -> None:
+        code = 'import os  # keep import\ntext = "a # not comment"\nvalue = 1  # trailing\n'
+        clean = strip_comments(code, language="python")
+        self.assertNotIn("# keep import", clean)
+        self.assertNotIn("# trailing", clean)
+        self.assertIn('"a # not comment"', clean)
 
-    def test_detects_critical_section_early_exit(self) -> None:
-        code = """
-        void f() {
-            EnterCriticalSection(&cs_SaveInfo);
-            if (x) return;
-            LeaveCriticalSection(&cs_SaveInfo);
-        }
-        """
-        _, findings = analyze_source(code, "schedule.cpp")
-        critical = [f for f in findings if f.vulnerability_type == "临界区未释放退出"]
-        self.assertEqual(len(critical), 1)
-        self.assertTrue(critical[0].execution_path)
+    def test_analyze_source_runs_semgrep_for_c(self) -> None:
+        code = "void f(char *dst, char *src){ strcpy(dst, src); }"
+        _, findings = analyze_source(code, "sample.c", language="c")
+        self.assertTrue(findings)
+        self.assertTrue(any("strcpy" in f.code_snippet for f in findings))
 
-    def test_detects_terminate_thread(self) -> None:
-        code = "if(!TerminateThread(runPCB->hThis,1)){ exit(0); }"
-        _, findings = analyze_source(code, "schedule.cpp")
-        self.assertTrue(any(f.vulnerability_type == "架构级风险 API" for f in findings))
-
-    def test_detects_nested_critical_sections_exit(self) -> None:
-        code = """
-        void f() {
-            EnterCriticalSection(&cs_A);
-            EnterCriticalSection(&cs_B);
-            return;
-            LeaveCriticalSection(&cs_B);
-            LeaveCriticalSection(&cs_A);
-        }
-        """
-        _, findings = analyze_source(code, "schedule.cpp")
-        critical = [f for f in findings if f.vulnerability_type == "临界区未释放退出"]
-        self.assertEqual(len(critical), 1)
-        joined_path = "\n".join(critical[0].execution_path)
-        self.assertIn("cs_A", joined_path)
-        self.assertIn("cs_B", joined_path)
+    def test_analyze_source_runs_semgrep_for_python(self) -> None:
+        code = (
+            "import subprocess\n"
+            "\n"
+            "def route_param(route_param):\n"
+            "    subprocess.call(\"grep -R {} .\".format(route_param), shell=True, cwd=\"/tmp\")\n"
+        )
+        _, findings = analyze_source(code, "demo.py", language="python")
+        self.assertTrue(findings)
+        self.assertTrue(any("grep" in f.code_snippet for f in findings))
 
     def test_detect_language_supports_c_cpp_and_java(self) -> None:
         from pathlib import Path
@@ -82,13 +64,48 @@ class ThreadViperTests(unittest.TestCase):
         }
         from pathlib import Path
 
-        findings = _parse_semgrep_json(json.dumps(payload), source_path=Path("Demo.java"), filename="Demo.java")
+        findings = _parse_semgrep_json(json.dumps(payload), source_text='Runtime.getRuntime().exec("bash", "-c", input);', filename="Demo.java")
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].filename, "Demo.java")
         self.assertEqual(findings[0].line_number, 12)
         self.assertEqual(findings[0].severity, "HIGH")
         self.assertEqual(findings[0].vulnerability_type, "java.lang.security.demo")
         self.assertIn("Runtime.getRuntime().exec", findings[0].code_snippet)
+        self.assertIn("ProcessBuilder", findings[0].remediation)
+
+    def test_build_semgrep_remediation_is_rule_specific(self) -> None:
+        self.assertIn(
+            "subprocess.run",
+            _build_semgrep_remediation(
+                "python.lang.security.dangerous-subprocess-use",
+                "Detected subprocess function",
+                'subprocess.call("grep", shell=True)',
+            ),
+        )
+        self.assertIn(
+            "yaml.safe_load",
+            _build_semgrep_remediation(
+                "python.lang.security.deserialization.avoid-pyyaml-load",
+                "yaml.load on untrusted input",
+                'yaml.load(data)',
+            ),
+        )
+        self.assertIn(
+            "check=True",
+            _build_semgrep_remediation(
+                "python.lang.correctness.unchecked-subprocess-call",
+                "This is not checking the return value of this subprocess call",
+                'subprocess.call("grep", shell=True)',
+            ),
+        )
+        self.assertIn(
+            "strncpy_s",
+            _build_semgrep_remediation(
+                "c.lang.security.strcpy",
+                "buffer overflow",
+                'strcpy(dst, src);',
+            ),
+        )
 
     def test_default_html_path_is_inferred_from_input(self) -> None:
         from pathlib import Path

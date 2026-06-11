@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 import json
 import shutil
 import subprocess
+import tempfile
+import tokenize
 
 
 @dataclass
@@ -21,20 +24,24 @@ class Vulnerability:
     severity: str = "MEDIUM"
     execution_path: List[str] = field(default_factory=list)
 
+def _strip_python_comments(source: str) -> str:
+    tokens: List[tuple[int, str]] = []
+    reader = io.StringIO(source).readline
+    try:
+        for token in tokenize.generate_tokens(reader):
+            if token.type in (tokenize.COMMENT, tokenize.ENCODING):
+                continue
+            tokens.append((token.type, token.string))
+    except tokenize.TokenError:
+        return source
 
-_BLACKLIST_RULES = {
-    "strcpy": (
-        "危险内存 API",
-        "检测到危险函数 `strcpy`，建议替换为安全的带边界检查函数 "
-        "`strncpy(dest, src, sizeof(dest) - 1);`",
-        "HIGH",
-    )
-}
-
-_STRCPY_CALL_PATTERN = re.compile(r"\bstrcpy\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)")
+    return tokenize.untokenize(tokens)
 
 
-def strip_comments(source: str) -> str:
+def strip_comments(source: str, language: str = "cpp") -> str:
+    if language == "python":
+        return _strip_python_comments(source)
+
     result: List[str] = []
     in_single_line_comment = False
     in_multi_line_comment = False
@@ -110,91 +117,20 @@ def strip_comments(source: str) -> str:
     return "".join(result)
 
 
-def _detect_blacklist(lines: Iterable[str], filename: str) -> List[Vulnerability]:
-    findings: List[Vulnerability] = []
-    for line_no, line in enumerate(lines, start=1):
-        for func_name, (vuln_type, default_remediation, severity) in _BLACKLIST_RULES.items():
-            if re.search(rf"\b{re.escape(func_name)}\s*\(", line):
-                remediation = default_remediation
-                if func_name == "strcpy":
-                    match = _STRCPY_CALL_PATTERN.search(line)
-                    if match:
-                        dest = match.group(1).strip()
-                        src = match.group(2).strip()
-                        remediation = (
-                            "检测到危险函数 `strcpy`，建议替换为安全的带边界检查函数 "
-                            f"`strncpy({dest}, {src}, sizeof({dest}) - 1);`"
-                        )
-                findings.append(
-                    Vulnerability(
-                        filename=filename,
-                        line_number=line_no,
-                        vulnerability_type=vuln_type,
-                        code_snippet=line.strip(),
-                        remediation=remediation,
-                        severity=severity,
-                    )
-                )
-    return findings
+def analyze_source(source: str, filename: str, language: str | None = None) -> tuple[str, List[Vulnerability]]:
+    if language is None:
+        language = _detect_language(Path(filename), source)
 
-
-def _detect_concurrency_issues(lines: List[str], filename: str) -> List[Vulnerability]:
-    findings: List[Vulnerability] = []
-    # Tracks active critical sections as (line_number, code_snippet) tuples.
-    lock_stack: List[tuple[int, str]] = []
-
-    for line_no, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        if "EnterCriticalSection" in stripped:
-            lock_stack.append((line_no, stripped))
-
-        if lock_stack and re.search(r"\b(return|break)\b|exit\s*\(", stripped):
-            lock_chain = [f"[Line {ln}] 锁被获取: {code}" for ln, code in lock_stack]
-            findings.append(
-                Vulnerability(
-                    filename=filename,
-                    line_number=line_no,
-                    vulnerability_type="临界区未释放退出",
-                    code_snippet=stripped,
-                    remediation="检测到临界区未释放即退出，可能导致全局死锁。请确保先调用 LeaveCriticalSection。",
-                    severity="CRITICAL",
-                    execution_path=lock_chain
-                    + [f"[Line {line_no}] 异常退出: {stripped} (致命: 锁未释放!)"],
-                )
-            )
-
-        if "LeaveCriticalSection" in stripped and lock_stack:
-            lock_stack.pop()
-# 因为 TerminateThread 这个 API 本身在微软官方文档里就是极度危险的，会导致目标线程的资源直接被抛弃
-        if "TerminateThread" in stripped:
-            findings.append(
-                Vulnerability(
-                    filename=filename,
-                    line_number=line_no,
-                    vulnerability_type="架构级风险 API",
-                    code_snippet=stripped,
-                    remediation="检测到 `TerminateThread`，建议改用事件通知 (Event) 或协作式退出机制优雅停止线程。",
-                    severity="HIGH",
-                )
-            )
-    return findings
-
-
-def analyze_source(source: str, filename: str) -> tuple[str, List[Vulnerability]]:
-    clean_source = strip_comments(source)
-    lines = clean_source.splitlines()
-    findings = _detect_blacklist(lines, filename)
-    findings.extend(_detect_concurrency_issues(lines, filename))
+    clean_source = strip_comments(source, language)
+    findings = _run_semgrep_on_source(filename=filename, source_text=clean_source, language=language)
     findings.sort(key=lambda item: (item.line_number, item.vulnerability_type))
     return clean_source, findings
 
 
 def analyze_file(path: Path) -> tuple[str, List[Vulnerability]]:
     raw = path.read_text(encoding="utf-8")
-    return analyze_source(raw, filename=path.name)
+    language = _detect_language(path, raw)
+    return analyze_source(raw, filename=path.name, language=language)
 
 
 def _detect_language(path: Path, source_text: str = "") -> str:
@@ -215,7 +151,7 @@ def _detect_language(path: Path, source_text: str = "") -> str:
     return "unknown"
 
 
-def _parse_semgrep_json(json_text: str, source_path: Path, filename: str) -> List[Vulnerability]:
+def _parse_semgrep_json(json_text: str, source_text: str, filename: str) -> List[Vulnerability]:
     findings: List[Vulnerability] = []
     try:
         payload = json.loads(json_text)
@@ -230,8 +166,12 @@ def _parse_semgrep_json(json_text: str, source_path: Path, filename: str) -> Lis
             line_no = start.get("line", 0) if isinstance(start, dict) else 0
             message = res.get("extra", {}).get("message", "")
             check_id = res.get("check_id", "semgrep")
-            remediation = res.get("extra", {}).get("metadata", {}).get("remediation", "") or "请参考 Semgrep 规则建议。"
-            code_snippet = _semgrep_code_snippet(source_path, line_no, res.get("extra", {}).get("lines"))
+            code_snippet = _semgrep_code_snippet(source_text, line_no, res.get("extra", {}).get("lines"))
+            remediation = _build_semgrep_remediation(
+                rule_id=_normalize_semgrep_rule_id(check_id),
+                message=message,
+                code_snippet=code_snippet,
+            )
             findings.append(
                 Vulnerability(
                     filename=Path(path).name,
@@ -247,15 +187,12 @@ def _parse_semgrep_json(json_text: str, source_path: Path, filename: str) -> Lis
     return findings
 
 
-def _semgrep_code_snippet(source_path: Path, line_no: int, fallback: str) -> str:
-    try:
-        lines = source_path.read_text(encoding="utf-8").splitlines()
-        if 1 <= line_no <= len(lines):
-            snippet = lines[line_no - 1].strip()
-            if snippet:
-                return snippet
-    except Exception:
-        pass
+def _semgrep_code_snippet(source_text: str, line_no: int, fallback: str) -> str:
+    lines = source_text.splitlines()
+    if 1 <= line_no <= len(lines):
+        snippet = lines[line_no - 1].strip()
+        if snippet:
+            return snippet
     return fallback or ""
 
 
@@ -279,7 +216,70 @@ def _normalize_semgrep_severity(severity: str) -> str:
     return normalized
 
 
-def _run_semgrep_on_file(path: Path) -> List[Vulnerability]:
+def _build_semgrep_remediation(rule_id: str, message: str, code_snippet: str) -> str:
+    haystack = f"{rule_id}\n{message}\n{code_snippet}".lower()
+
+    if (
+        "dangerous-subprocess-use" in haystack
+        or "command-injection" in haystack
+        or "injection" in haystack and "subprocess" in haystack
+        or "subprocess.call" in haystack
+        or "subprocess.popen" in haystack
+        or "shell=true" in haystack
+    ):
+        return (
+            "不要把用户输入拼接到 shell=True 的命令中；改用 subprocess.run([...], shell=False, check=True) "
+            "或 subprocess.call([...], shell=False)，把参数拆成独立列表，并对外部输入做白名单校验。"
+        )
+
+    if "return value of this subprocess call" in haystack or "unchecked" in haystack and "subprocess" in haystack:
+        return (
+            "如果你需要判断命令是否成功执行，改用 subprocess.run(..., check=True) 或 subprocess.check_call(...); "
+            "如果继续使用 call/run，请显式检查 returncode 并处理失败分支。"
+        )
+
+    if "command-injection" in haystack or "runtime.getruntime().exec" in haystack or "loadlibrary" in haystack:
+        return (
+            "不要把动态字符串直接传给 Runtime.exec / loadLibrary；改用固定参数数组或 ProcessBuilder，"
+            "避免 bash -c / sh -c，把外部输入先做白名单校验或转义后再使用。"
+        )
+
+    if "yaml.load" in haystack or "deserialization" in haystack or "unsafe loader" in haystack:
+        return (
+            "不要使用 yaml.load 解析不可信输入；改为 yaml.safe_load 或显式指定 SafeLoader，"
+            "只允许受信任的数据结构和标签。"
+        )
+
+    if "strcpy" in haystack or "strncpy" in haystack or "buffer overflow" in haystack:
+        return (
+            "不要使用 strcpy；改为 strncpy_s、snprintf 或带长度检查的拷贝方式，"
+            "并在拷贝后手动补 '\\0'，确保目标缓冲区长度足够。"
+        )
+
+    if "xss" in haystack or "html" in haystack or "template" in haystack:
+        return (
+            "对输出内容做 HTML 转义，启用模板引擎的自动转义，把用户输入和页面渲染分离。"
+        )
+
+    if "sql" in haystack or "sqli" in haystack:
+        return (
+            "改用参数化查询或预编译语句，不要拼接 SQL 字符串。"
+        )
+
+    if "deserialize" in haystack:
+        return (
+            "不要反序列化不可信输入；改为受限反序列化、签名校验或安全数据格式。"
+        )
+
+    if message:
+        return (
+            f"建议按该规则上下文替换为更安全的 API 和输入校验方式；Semgrep 提示：{message}"
+        )
+
+    return "建议按该规则上下文替换为更安全的 API 和输入校验方式。"
+
+
+def _run_semgrep_on_source(filename: str, source_text: str, language: str) -> List[Vulnerability]:
     findings: List[Vulnerability] = []
     semgrep_bin = shutil.which("semgrep")
     if not semgrep_bin:
@@ -287,12 +287,6 @@ def _run_semgrep_on_file(path: Path) -> List[Vulnerability]:
 
     # Prefer using the checked-in semgrep-rules submodule when available.
     rules_dir = Path("semgrep-rules")
-    try:
-        source_text = path.read_text(encoding="utf-8")
-    except Exception:
-        source_text = ""
-
-    language = _detect_language(path, source_text)
     config_paths: List[str] = []
     if rules_dir.exists():
         if language in ("c", "cpp"):
@@ -307,16 +301,28 @@ def _run_semgrep_on_file(path: Path) -> List[Vulnerability]:
     if not config_paths:
         config_paths = ["auto"]
 
+    suffix_map = {"c": ".c", "cpp": ".c", "java": ".java", "python": ".py"}
+    temp_path: Path | None = None
     try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=suffix_map.get(language, ".txt"), delete=False) as temp_file:
+            temp_file.write(source_text)
+            temp_path = Path(temp_file.name)
+
         command = [semgrep_bin, "--json"]
         for config_path in config_paths:
             command.extend(["--config", config_path])
-        command.append(str(path))
+        command.append(str(temp_path))
         proc = subprocess.run(command, capture_output=True, text=True, check=False)
         if proc.returncode == 0 or proc.stdout:
-            findings = _parse_semgrep_json(proc.stdout, source_path=path, filename=path.name)
+            findings = _parse_semgrep_json(proc.stdout, source_text=source_text, filename=filename)
     except Exception:
         pass
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
     return findings
 
@@ -443,20 +449,7 @@ def main() -> int:
 
         language = _detect_language(path, raw_source)
 
-        findings: List[Vulnerability] = []
-
-        # Native simple analyzer (original implementation) for C/C++ files
-        if language in ("c", "cpp"):
-            clean_source, local_findings = analyze_source(raw_source, filename=path.name)
-            findings.extend(local_findings)
-        else:
-            # For unknown languages still try to read source for console rendering
-            clean_source = raw_source
-
-        # Try Semgrep-based analysis when available (covers many languages incl. Java/C)
-        semgrep_findings = _run_semgrep_on_file(path)
-        if semgrep_findings:
-            findings.extend(semgrep_findings)
+        _clean_source, findings = analyze_source(raw_source, filename=path.name, language=language)
 
         # Deduplicate by (filename, line, type)
         seen = set()

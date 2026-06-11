@@ -1,109 +1,88 @@
 # ThreadViper
 
-ThreadViper 是一个面向 C、C++、Java、Python 的轻量级安全扫描工具。它结合了本地规则和 Semgrep 规则库，用来发现危险内存 API、并发临界区提前退出、危险线程终止调用，以及更多规则库覆盖到的安全问题。
+ThreadViper 是一个面向 C、C++、Java、Python 的轻量级安全扫描工具。它会先按语言剔除注释，再调用 `semgrep-rules` 子模块中的规则库进行检测，重点覆盖危险内存 API、命令注入、危险反序列化等安全问题。
 
-实际上是编码安全实训的大作业~
+这是一个编码安全实训项目，目标是把“能扫样例”升级成“能扫真实源码”。
 
-## 它能做什么
+## 功能
 
-- 扫描 C / C++ 源码中的 `strcpy`、临界区提前退出、`TerminateThread` 等问题。
-- 扫描 Java / Python 源码中的命令注入、危险运行时调用、危险反序列化等 Semgrep 规则命中项。
-- 自动剔除注释，减少注释文本导致的误报。
-- 输出终端报告，支持 `rich` 时显示彩色表格。
-- 默认生成 HTML 报告，便于共享与归档。
-- 通过 `semgrep-rules` 子模块直接复用更完整的规则集，不再依赖样例手写判断。
+- 按语言清理注释，减少注释导致的误报。
+- 扫描 C / C++ 中的危险字符串拷贝等问题。
+- 扫描 Java / Python 中的命令注入、危险运行时调用、危险反序列化等问题。
+- 终端输出检测结果，支持 `rich` 时显示彩色表格。
+- 默认生成 HTML 报告，便于归档和共享。
+- 复用 GitHub 引入的 `semgrep-rules` 规则仓库，不再依赖手写硬编码规则。
+- 每条命中都会输出更具体的修复建议，例如命令执行改为参数数组、YAML 反序列化改为 `safe_load`、字符串拷贝改为带边界检查的接口。
 
-## 环境与安装
+## 安装与运行
 
 这个项目使用 `uv` 管理依赖和运行环境。
 
-### 1. 初始化依赖
+### 安装依赖
 
 ```bash
 uv sync
 ```
 
-### 2. 运行测试
+如果你是刚克隆仓库，还需要初始化子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
+### 运行测试
 
 ```bash
 uv run python -m unittest -v
 ```
 
-### 3. 运行扫描
+### 运行扫描
 
 ```bash
 uv run threadviper samples/c_demo.c
 uv run threadviper samples/cpp_demo.cpp
 uv run threadviper samples/java_demo.java
 uv run threadviper samples/python_demo.py
+uv run threadviper "测试用例1.txt"
+uv run threadviper "测试用例2.txt"
 ```
 
-如果你刚克隆仓库，还需要初始化子模块：
+默认情况下，ThreadViper 会在当前目录自动生成 HTML 报告。单文件扫描时，HTML 文件默认使用同名路径，例如 `samples/c_demo.html`；多文件扫描时，默认输出为 `threadviper-report.html`。你也可以显式传入 `--html` 指定路径。
 
-```bash
-git submodule update --init --recursive
-```
+## 检测流程
 
-## 功能说明
+1. 先按语言识别源码类型。
+2. 按对应语言剔除注释。
+3. 将清理后的源码交给 Semgrep 扫描。
+4. 将结果统一转换成 `Vulnerability` 结构。
+5. 在命令行和 HTML 报告中输出检测结果。
 
-### 本地规则
+终端不再输出去注释后的源码，只输出检测结果本身。
 
-ThreadViper 先对源码做注释清理，然后执行本地规则扫描：
+## 规则来源
 
-- `strcpy` 危险内存 API
-- `EnterCriticalSection` / `LeaveCriticalSection` 状态追踪
-- 临界区内的 `return`、`break`、`exit(...)`
-- `TerminateThread` 高风险 API
-
-### Semgrep 规则库
-
-仓库中包含 `semgrep-rules` 子模块，它提供更完整的规则库。当前实现会按语言选择相应规则目录：
+仓库中包含 `semgrep-rules` 子模块，当前会按语言选择规则目录：
 
 - C / C++：`semgrep-rules/c` 和 `semgrep-rules/generic`
 - Java：`semgrep-rules/java` 和 `semgrep-rules/generic`
 - Python：`semgrep-rules/python` 和 `semgrep-rules/generic`
 
-Semgrep 的命中结果会被转换为统一的 `Vulnerability` 结构，再输出到终端和 HTML 报告中。
+如果未来继续扩展语言，只需要补对应的规则目录和语言识别逻辑即可。
+
+## 样例
+
+- `samples/c_demo.c`：C 示例。
+- `samples/cpp_demo.cpp`：C++ 示例。
+- `samples/java_demo.java`：Java 示例。
+- `samples/python_demo.py`：Python 示例。
+- 根目录下的 `测试用例1.txt` 和 `测试用例2.txt`：虽然扩展名是 `.txt`，但内容是 C++ 源码，工具会按内容识别并扫描。
 
 ## 仓库结构
 
 - `threadviper.py`：主程序。
 - `test_threadviper.py`：单元测试。
-- `samples/`：多语言样例输入。
+- `samples/`：演示样例。
 - `semgrep-rules/`：Semgrep 规则子模块。
 - `.github/workflows/ci.yml`：CI 工作流。
 - `pyproject.toml`：`uv` / Python 项目配置。
-- `uv.lock`：锁定后的依赖版本。
-
-## 多语言样例
-
-- `samples/c_demo.c`：C 示例，覆盖 `strcpy`、临界区退出和 `TerminateThread`。
-- `samples/cpp_demo.cpp`：C++ 示例，覆盖相同的本地规则路径。
-- `samples/java_demo.java`：Java 示例，覆盖 Semgrep 的 Java 规则。
-- `samples/python_demo.py`：Python 示例，覆盖 Semgrep 的 Python 规则。
-
-## 冗余文件说明
-
-为了让仓库更干净，以下内容不应该作为源码保留：
-
-- 根目录和 `samples/` 下的 HTML 报告，它们是运行时生成物。
-- `requirements.txt`，现在已经被 `pyproject.toml` 和 `uv.lock` 替代。
-- `threadviper.egg-info/`，这是构建元数据，不属于源码。
-
-这些内容已经被忽略或清理，不需要手工维护。
-
-## 开发建议
-
-- 修改规则后先跑 `uv run python -m unittest -v`。
-- 修改 Semgrep 接入后，再跑一次 Java 示例扫描验证输出。
-- 如果你改了 `semgrep-rules` 子模块内容，记得提交子模块指针变化。
-
-## 最常用命令
-
-```bash
-uv sync
-uv run python -m unittest -v
-uv run threadviper samples/c_demo.c
-uv run threadviper samples/java_demo.java
-uv run threadviper samples/java_demo.java --html report.html
-```
+- `uv.lock`：锁定依赖版本。
