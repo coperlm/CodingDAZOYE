@@ -505,5 +505,3 @@ void stopAllTreads()
   p=q;
  }
 }
-
-

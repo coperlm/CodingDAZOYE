@@ -165,7 +165,7 @@ def _detect_concurrency_issues(lines: List[str], filename: str) -> List[Vulnerab
 
         if "LeaveCriticalSection" in stripped and lock_stack:
             lock_stack.pop()
-
+# 因为 TerminateThread 这个 API 本身在微软官方文档里就是极度危险的，会导致目标线程的资源直接被抛弃
         if "TerminateThread" in stripped:
             findings.append(
                 Vulnerability(
