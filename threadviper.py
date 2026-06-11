@@ -6,6 +6,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List
+import json
+import shutil
+import subprocess
 
 
 @dataclass
@@ -194,7 +197,131 @@ def analyze_file(path: Path) -> tuple[str, List[Vulnerability]]:
     return analyze_source(raw, filename=path.name)
 
 
-def _render_console(path: Path, clean_source: str, findings: List[Vulnerability]) -> None:
+def _detect_language(path: Path, source_text: str = "") -> str:
+    suffix = path.suffix.lower()
+    if suffix in (".c", ".h"):
+        return "c"
+    if suffix in (".cpp", ".cc", ".cxx", ".hpp", ".hh"):
+        return "cpp"
+    if suffix in (".java",):
+        return "java"
+    if suffix in (".py",):
+        return "python"
+    if source_text:
+        if re.search(r"\bdef\s+\w+\s*\(|\bimport\s+\w+", source_text) and "#include" not in source_text:
+            return "python"
+        if re.search(r"#include\s*[<\"]|\busing\s+namespace\s+std\b|\bstd::|\bcout\b|\bCRITICAL_SECTION\b|\bHANDLE\b", source_text):
+            return "cpp"
+    return "unknown"
+
+
+def _parse_semgrep_json(json_text: str, source_path: Path, filename: str) -> List[Vulnerability]:
+    findings: List[Vulnerability] = []
+    try:
+        payload = json.loads(json_text)
+    except Exception:
+        return findings
+
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+    for res in results:
+        try:
+            path = res.get("path") or res.get("extra", {}).get("metadata", {}).get("path") or filename
+            start = res.get("start", {})
+            line_no = start.get("line", 0) if isinstance(start, dict) else 0
+            message = res.get("extra", {}).get("message", "")
+            check_id = res.get("check_id", "semgrep")
+            remediation = res.get("extra", {}).get("metadata", {}).get("remediation", "") or "请参考 Semgrep 规则建议。"
+            code_snippet = _semgrep_code_snippet(source_path, line_no, res.get("extra", {}).get("lines"))
+            findings.append(
+                Vulnerability(
+                    filename=Path(path).name,
+                    line_number=line_no,
+                    vulnerability_type=_normalize_semgrep_rule_id(check_id),
+                    code_snippet=code_snippet,
+                    remediation=remediation,
+                    severity=_normalize_semgrep_severity(res.get("extra", {}).get("severity", "MEDIUM")),
+                )
+            )
+        except Exception:
+            continue
+    return findings
+
+
+def _semgrep_code_snippet(source_path: Path, line_no: int, fallback: str) -> str:
+    try:
+        lines = source_path.read_text(encoding="utf-8").splitlines()
+        if 1 <= line_no <= len(lines):
+            snippet = lines[line_no - 1].strip()
+            if snippet:
+                return snippet
+    except Exception:
+        pass
+    return fallback or ""
+
+
+def _normalize_semgrep_rule_id(rule_id: str) -> str:
+    normalized = rule_id or "semgrep"
+    if normalized.startswith("semgrep-rules."):
+        return normalized.removeprefix("semgrep-rules.")
+    return normalized
+
+
+def _normalize_semgrep_severity(severity: str) -> str:
+    normalized = (severity or "MEDIUM").upper()
+    if normalized == "ERROR":
+        return "HIGH"
+    if normalized == "WARNING":
+        return "MEDIUM"
+    if normalized == "INFO":
+        return "LOW"
+    if normalized not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+        return "MEDIUM"
+    return normalized
+
+
+def _run_semgrep_on_file(path: Path) -> List[Vulnerability]:
+    findings: List[Vulnerability] = []
+    semgrep_bin = shutil.which("semgrep")
+    if not semgrep_bin:
+        return findings
+
+    # Prefer using the checked-in semgrep-rules submodule when available.
+    rules_dir = Path("semgrep-rules")
+    try:
+        source_text = path.read_text(encoding="utf-8")
+    except Exception:
+        source_text = ""
+
+    language = _detect_language(path, source_text)
+    config_paths: List[str] = []
+    if rules_dir.exists():
+        if language in ("c", "cpp"):
+            config_paths = [str(rules_dir / "c"), str(rules_dir / "generic")]
+        elif language == "java":
+            config_paths = [str(rules_dir / "java"), str(rules_dir / "generic")]
+        elif language == "python":
+            config_paths = [str(rules_dir / "python"), str(rules_dir / "generic")]
+        else:
+            config_paths = [str(rules_dir / "generic")]
+
+    if not config_paths:
+        config_paths = ["auto"]
+
+    try:
+        command = [semgrep_bin, "--json"]
+        for config_path in config_paths:
+            command.extend(["--config", config_path])
+        command.append(str(path))
+        proc = subprocess.run(command, capture_output=True, text=True, check=False)
+        if proc.returncode == 0 or proc.stdout:
+            findings = _parse_semgrep_json(proc.stdout, source_path=path, filename=path.name)
+    except Exception:
+        pass
+
+    return findings
+
+
+def _render_console(path: Path, findings: List[Vulnerability]) -> None:
     try:
         from rich.console import Console
         from rich.table import Table
@@ -202,8 +329,6 @@ def _render_console(path: Path, clean_source: str, findings: List[Vulnerability]
         Console = None
 
     if Console is None:
-        print(f"\n=== {path.name} 去注释结果 ===")
-        print(clean_source)
         print("\n=== 漏洞检测结果 ===")
         if not findings:
             print("未发现漏洞。")
@@ -218,8 +343,6 @@ def _render_console(path: Path, clean_source: str, findings: List[Vulnerability]
         return
 
     console = Console()
-    console.rule(f"[bold cyan]{path.name} 去注释结果")
-    console.print(clean_source)
     console.rule("[bold red]漏洞检测结果")
     if not findings:
         console.print("[green]未发现漏洞。[/green]")
@@ -296,22 +419,60 @@ def _render_html(findings: List[Vulnerability], output_path: Path) -> None:
     output_path.write_text(html_body, encoding="utf-8")
 
 
+def _default_html_path(paths: List[Path]) -> Path:
+    if len(paths) == 1:
+        return paths[0].with_suffix(".html")
+    return Path("threadviper-report.html")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="ThreadViper: C/C++ 并发与内存安全检测工具")
-    parser.add_argument("source", nargs="+", help="待检测的 C/C++ 源文件路径")
-    parser.add_argument("--html", dest="html_path", help="输出 HTML 报告路径（可选）")
+    parser = argparse.ArgumentParser(description="ThreadViper: 多语言（C/C++/Java）并发与安全检测工具")
+    parser.add_argument("source", nargs="+", help="待检测的源文件路径（支持 C/C++/Java）")
+    parser.add_argument("--html", dest="html_path", help="输出 HTML 报告路径（可选，默认自动生成）")
     args = parser.parse_args()
 
-    all_findings: List[Vulnerability] = []
-    for source in args.source:
-        path = Path(source)
-        clean_source, findings = analyze_file(path)
-        _render_console(path, clean_source, findings)
-        all_findings.extend(findings)
+    source_paths = [Path(source) for source in args.source]
+    html_path = Path(args.html_path) if args.html_path else _default_html_path(source_paths)
 
-    if args.html_path:
-        _render_html(all_findings, Path(args.html_path))
-        print(f"\nHTML 报告已生成: {args.html_path}")
+    all_findings: List[Vulnerability] = []
+    for path in source_paths:
+        try:
+            raw_source = path.read_text(encoding="utf-8")
+        except Exception:
+            raw_source = ""
+
+        language = _detect_language(path, raw_source)
+
+        findings: List[Vulnerability] = []
+
+        # Native simple analyzer (original implementation) for C/C++ files
+        if language in ("c", "cpp"):
+            clean_source, local_findings = analyze_source(raw_source, filename=path.name)
+            findings.extend(local_findings)
+        else:
+            # For unknown languages still try to read source for console rendering
+            clean_source = raw_source
+
+        # Try Semgrep-based analysis when available (covers many languages incl. Java/C)
+        semgrep_findings = _run_semgrep_on_file(path)
+        if semgrep_findings:
+            findings.extend(semgrep_findings)
+
+        # Deduplicate by (filename, line, type)
+        seen = set()
+        unique_findings: List[Vulnerability] = []
+        for f in findings:
+            key = (f.filename, f.line_number, f.vulnerability_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_findings.append(f)
+
+        _render_console(path, unique_findings)
+        all_findings.extend(unique_findings)
+
+    _render_html(all_findings, html_path)
+    print(f"\nHTML 报告已生成: {html_path}")
 
     return 0
 

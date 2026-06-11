@@ -1,2 +1,4 @@
 *.html
 __pycache__/*
+.venv/
+threadviper.egg-info/

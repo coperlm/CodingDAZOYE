@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "threadviper"
+version = "0.1.0"
+description = "Multi-language C/C++/Java security scanner with local rules and Semgrep integration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "rich>=13.0.0",
+  "semgrep>=1.0.0",
+]
+
+[project.scripts]
+threadviper = "threadviper:main"
+
+[tool.setuptools]
+py-modules = ["threadviper"]
