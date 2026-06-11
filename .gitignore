@@ -1,4 +1,4 @@
 *.html
-__pycache__/*
+__pycache__/
 .venv/
 threadviper.egg-info/
